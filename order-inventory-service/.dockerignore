@@ -1,0 +1,15 @@
+# Ignore the following files and directories when building the Docker image
+**/.git
+**/target
+**/logs
+**/src/test
+**/src/main/resources/db/migration/*.sql
+**/README.md
+**/Dockerfile
+**/.dockerignore
+**/k8s
+**/helm
+**/scripts
+**/.github
+**/Makefile
+**/pom.xml

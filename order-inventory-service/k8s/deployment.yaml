@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-inventory-service
+  labels:
+    app: order-inventory-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-inventory-service
+  template:
+    metadata:
+      labels:
+        app: order-inventory-service
+    spec:
+      containers:
+        - name: order-inventory-service
+          image: your-docker-repo/order-inventory-service:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: prod
+            - name: DATABASE_URL
+              value: jdbc:postgresql://your-database-host:5432/your-database
+            - name: DATABASE_USERNAME
+              value: your-username
+            - name: DATABASE_PASSWORD
+              value: your-password
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+      imagePullSecrets:
+        - name: regcred

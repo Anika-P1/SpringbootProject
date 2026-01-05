@@ -1,0 +1,3 @@
+com\example\orderinventory\controller\OrderControllerTest.class
+com\example\orderinventory\repository\OrderRepositoryTest.class
+com\example\orderinventory\service\OrderServiceTest.class

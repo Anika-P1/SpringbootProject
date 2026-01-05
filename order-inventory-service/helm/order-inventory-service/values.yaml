@@ -1,0 +1,30 @@
+# Default configuration values for the Helm chart
+
+replicaCount: 1
+
+image:
+  repository: your-docker-repo/order-inventory-service
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  name: order-inventory-service
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  annotations: {}
+  hosts:
+    - host: chart-example.local
+      paths:
+        - /
+  tls: [] 
+
+resources: {}
+  
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
