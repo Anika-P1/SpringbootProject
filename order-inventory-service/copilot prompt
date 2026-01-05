@@ -1,0 +1,196 @@
+
+You are an expert Spring Boot engineer. Generate a production-grade microservice named `order-inventory-service` that manages Orders and Inventory for a mid-scale commerce platform. Use Java 21 and Spring Boot 3.x, PostgreSQL, JPA, Flyway, Micrometer, Actuator, Testcontainers, and Docker. Prioritize correctness under concurrency, clean architecture, and testability.
+
+### 1) Tech Stack & Dependencies
+- Language: Java 21
+- Build: Maven
+- Spring Boot Starters: web, data-jpa, validation, security, actuator
+- DB: PostgreSQL driver, Flyway
+- Observability: micrometer-registry-prometheus
+- Test: junit-jupiter, spring-boot-starter-test, testcontainers (postgresql + junit-jupiter)
+- Concurrency test helpers: awaitility
+- Optional: lombok (ok to use)
+- No reactive stack required
+- Use SLF4J (structured logging key=value style), MDC correlation-id filter
+
+Create `pom.xml` with the above, proper plugin config for Java 21, surefire/failsafe for int/integration tests.
+
+### 2) Architecture & Packaging (Clean, layered)
+Base package: `com.example.oms`
+- `api` (controllers, request/response DTOs, exception handlers)
+- `application` (use cases/services with transaction boundaries)
+- `domain` (entities, value objects, enums, domain exceptions)
+- `infrastructure` (repositories, JPA mappings, db configs)
+- `config` (security, web, metrics, logging/correlation)
+- `observability` (metrics helper)
+- `support` (util, test fixtures)
+
+### 3) Domain Model
+Entities:
+- `Inventory`
+  - `productId` (PK)
+  - `available` (int >= 0)
+  - `reserved` (int >= 0)
+  - auditing fields (createdAt, updatedAt)
+- `Order`
+  - `id` (UUID)
+  - `status` (enum: PENDING, CONFIRMED, CANCELLED, FAILED)
+  - `items` (one-to-many)
+  - `createdAt`, `updatedAt`
+- `OrderItem`
+  - `id`
+  - `orderId` (FK)
+  - `productId`
+  - `quantity` (int > 0)
+  
+Rules:
+- Track `available` and `reserved` in `Inventory`. 
+- On order creation (PENDING), **reserve inventory atomically**: decrement `available`, increment `reserved`.
+- On confirm: decrement `reserved` only (available already reduced).
+- On cancel or timeout: increment `available`, decrement `reserved`.
+- No overselling ever.
+
+### 4) Concurrency & Transactions (Non-negotiable)
+**Choose and implement Pessimistic Locking** on `Inventory` rows per `productId`:
+- Use JPA `@Lock(PESSIMISTIC_WRITE)` / `SELECT ... FOR UPDATE` during reservation/release to prevent overselling under concurrent requests.
+- Each order creation runs in a single transaction:
+  1. Create Order with PENDING.
+  2. For each item: lock corresponding inventory row(s), check `available >= qty`, then apply updates (available -= qty, reserved += qty).
+  3. If any product cannot be reserved, **rollback entire tx** and return 409/422 with a clean error; the order must not persist as PENDING in this case (or persist with FAILED and no reservations; choose one consistent model—prefer rollback with no partial state).
+- Confirm/Cancel in their own transactions with the same locking on affected inventory rows.
+- Explain this approach and trade-offs in README.
+- Include a scheduled job that cancels PENDING orders older than, say, 15 minutes (configurable), releasing reservations (also transactional with locking).
+
+### 5) REST APIs (Controllers + DTOs + Validation)
+- `POST /orders` -> create order (items: productId, quantity). Returns order with status PENDING if reservation successful; otherwise error (409/422).
+- `GET /orders/{id}` -> fetch order by id.
+- `POST /orders/{id}/confirm` -> confirm order, adjust inventory accordingly.
+- `POST /orders/{id}/cancel` -> cancel order, release inventory.
+- `GET /inventory/{productId}` -> returns current `available` and `reserved`.
+
+HTTP semantics:
+- Use 201 Created for successful order creation, include `Location` header.
+- Use 404 for not found, 400 for validation errors, 409/422 for reservation conflicts.
+- Use problem+json style error body (RFC 7807-like) or a clean structured error object.
+
+### 6) Data Layer
+- Database: PostgreSQL
+- Migrations: Flyway
+- Provide versioned migrations:
+  - `V1__init.sql`: create tables `inventory`, `orders`, `order_items`, constraints, indexes.
+    - Check constraints ensure non-negative counts.
+    - `orders.status` stored as string; add indexes on `orders.status` and `orders.created_at`.
+  - `V2__seed_inventory.sql`: optional sample rows for a few productIds for demo/testing.
+- Include rollback notes in README (2-phase migration strategy: add, backfill, switch; no destructive changes without prior deprecation).
+
+### 7) Security
+- Implement **Basic Authentication** (simplest viable).
+- Protect write endpoints: `POST /orders`, `POST /orders/{id}/confirm`, `POST /orders/{id}/cancel`.
+- Allow public read for `GET /orders/{id}` and `GET /inventory/{productId}`.
+- In-memory user store with a demo user (from environment variables), BCrypt encoded.
+- Explain trade-offs vs JWT in README.
+
+### 8) Observability
+- Enable Actuator: `/actuator/health`, `/actuator/info`, `/actuator/metrics`, `/actuator/prometheus`.
+- Add **custom Micrometer counters**:
+  - `orders.created.success`
+  - `orders.created.failure`
+- Add a simple `HandlerInterceptor` or filter that handles **correlation IDs**:
+  - Read `X-Correlation-Id` or generate one.
+  - Put in MDC and response header.
+  - Log structured entries like: `event=order_create outcome=success orderId=... correlationId=...`.
+- Basic structured logging config (key=value; no external logback encoder dependency).
+
+### 9) Testing (Mandatory)
+- Unit tests for `application` layer services: creation, confirmation, cancellation logic.
+- Repository tests for pessimistic locking behavior (optional).
+- **Integration tests with Testcontainers (PostgreSQL)**:
+  - Bring up a PostgreSQL container, run Flyway migrations.
+  - Happy path: create order -> confirm -> verify inventory and order status.
+  - Cancellation path: create order -> cancel -> inventory restored.
+- **Concurrency test** proving correctness:
+  - Seed inventory for `product-1` with `available=50`.
+  - Start 100 concurrent attempts to `POST /orders` for quantity=1 (via service layer or WebTestClient/MockMvc).
+  - Assert that only 50 succeed, 50 fail with 409/422, and final inventory is `available=0`, `reserved=50` (if not auto-confirmed).
+  - Then confirm some or cancel all and verify invariant holds (no negative counts; no oversell).
+- Use Awaitility or CountDownLatch + ExecutorService for synchronization.
+
+### 10) Config & Run
+- `application.yml`:
+  - Separate `application-test.yml` for Testcontainers dynamic properties.
+  - Expose actuator only on management port or path.
+  - Basic auth users/password configurable via env.
+  - Order timeout duration configurable.
+- `Dockerfile`:
+  - Multi-stage build (mvnw wrapper included).
+  - Run as non-root user.
+- `docker-compose.yml`:
+  - Services: `app` + `postgres`.
+  - Healthchecks, env vars, proper depends_on with health condition.
+  - Single command to run: `docker compose up --build`.
+- Include `.env.example` for credentials and app settings.
+
+### 11) README.md (Must write)
+- Architecture overview (layers, responsibilities).
+- Concurrency strategy: **Pessimistic locking** details, why chosen, trade-offs vs optimistic/event-driven.
+- Transaction boundaries and failure handling.
+- Security approach and trade-offs.
+- Observability: what’s logged, metrics names, how to scrape Prometheus.
+- Database migrations: versioning approach, rollback safety notes.
+- How to run locally (JDK 21, Maven) and with Docker Compose.
+- How to run tests (unit + integration), including concurrency test.
+- API examples (curl).
+- Future improvements (outbox pattern, retry policies, idempotency keys, tracing with OpenTelemetry).
+
+### 12) Copilot Usage Log
+- Create `copilot-notes.md`:
+  - List **all prompts** used (including this one).
+  - Mark which files/sections were **Copilot-assisted**.
+  - Note where suggestions were **rejected or corrected** and why.
+  - Short reflection: what prompting patterns worked best.
+
+### 13) Files to Generate (with content)
+Create all of the following with complete, compilable code:
+
+- `pom.xml`
+- `.gitignore`, `.editorconfig`, `.gitattributes`, `README.md`, `copilot-notes.md`, `.env.example`
+- `src/main/java/com/example/oms/...` per package plan:
+  - `api/OrderController.java`, `InventoryController.java`, DTOs (CreateOrderRequest, OrderResponse, InventoryResponse), `ApiExceptionHandler.java`
+  - `application/OrderService.java`, `InventoryService.java`, `OrderTimeoutJob.java`
+  - `domain/Order.java`, `OrderItem.java`, `OrderStatus.java`, `Inventory.java`, domain exceptions like `InsufficientInventoryException`
+  - `infrastructure/repository/OrderRepository.java`, `OrderItemRepository.java`, `InventoryRepository.java` with `@Lock(PESSIMISTIC_WRITE)` methods
+  - `config/SecurityConfig.java`, `config/WebConfig.java` (CORS if needed), `config/FlywayConfig.java` (if custom), `config/JacksonConfig.java` (optional)
+  - `observability/CorrelationIdFilter.java` (or interceptor), `MetricsPublisher.java`
+  - `OrderInventoryServiceApplication.java`
+  - `resources/application.yml`, `resources/application-test.yml`, `resources/logback-spring.xml` (simple pattern with MDC)
+- `src/main/resources/db/migration/V1__init.sql` (create tables with constraints and indexes)
+- `src/main/resources/db/migration/V2__seed_inventory.sql` (optional seed)
+- Tests under `src/test/java/...`:
+  - `application/OrderServiceTest.java` (unit)
+  - `integration/OrderFlowIT.java` (Testcontainers happy/cancel flow)
+  - `integration/ConcurrencyIT.java` (proves no oversell under 100 concurrent creates)
+- Docker:
+  - `Dockerfile` (multi-stage)
+  - `docker-compose.yml`
+
+### 14) Behavioral Details (Important)
+- Validate all inputs (Bean Validation): quantities > 0, non-empty items, unique productIds per order request.
+- Map entities to DTOs cleanly; do not leak JPA entities to controllers.
+- Use `@Transactional` at service layer methods; keep controllers thin.
+- Ensure idempotent confirm/cancel:
+  - Confirm on already CONFIRMED -> 200 no-op
+  - Cancel on already CANCELLED -> 200 no-op
+  - Prevent confirm after cancel and vice versa with clear 409 where appropriate.
+- Return consistent error codes and JSON bodies.
+- Logging must include `correlationId`, `orderId`, `event`, `outcome`, and `reason` (on failures).
+- Metrics: increment success/failure counters in the service layer after transaction result is known.
+
+### 15) Acceptance & Verification
+- The service must build and tests must pass with `./mvnw clean verify`.
+- `docker compose up --build` starts PostgreSQL and the app; `/actuator/health` is UP.
+- Concurrency integration test consistently proves no oversell.
+- README explains trade-offs and decisions clearly.
+- Provide realistic sample `curl` calls in README.
+
+Start generating the full project now with all files and content. Do not use placeholders—provide complete, compilable code and tests.
+``
